@@ -214,7 +214,6 @@ bash ./scripts/anomaly_detection/PSM/TimesNet.sh
 bash ./scripts/classification/TimesNet.sh
 ```
 
-
 ### 开发自定义模型
 - 将模型文件放入 `./models`，可参考 `./models/Transformer.py`。
 - 在 `./scripts` 下创建对应的运行脚本。
