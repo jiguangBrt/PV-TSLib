@@ -179,6 +179,9 @@ if __name__ == '__main__':
     elif args.task_name == 'short_term_forecast':
         from exp.exp_short_term_forecasting import Exp_Short_Term_Forecast
         Exp = Exp_Short_Term_Forecast
+    elif args.task_name == 'solar_physics':
+        from exp.exp_solar_physics import Exp_Solar_Physics
+        Exp = Exp_Solar_Physics
     elif args.task_name == 'imputation':
         from exp.exp_imputation import Exp_Imputation
         Exp = Exp_Imputation
