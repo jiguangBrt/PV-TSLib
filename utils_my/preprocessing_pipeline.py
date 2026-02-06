@@ -9,40 +9,53 @@ import glob
 
 # --- 📍 路径配置 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-INPUT_DIR = os.path.join(BASE_DIR, '../dataset/solar_raw_clean') # 读取清洗后的数据
-OUTPUT_DIR = os.path.join(BASE_DIR, '../dataset/solar_processed_mvmd')
+INPUT_DIR = os.path.join(BASE_DIR, '../dataset/solar_raw_clean') 
+OUTPUT_DIR = os.path.join(BASE_DIR, '../dataset/solar_processed_mvmd_xian') # 输出目录改名以示区分
 
-# --- ⚙️ VMD 参数配置 ---
+# --- ⚙️ VMD 参数 ---
 K_MODES = 8
 ALPHA = 2000
 TAU = 0
 
-# --- 🌍 物理参数 ---
-DEFAULT_LAT = 37.0
-DEFAULT_LON = 112.0
+# --- 🌍 物理参数 (针对西安/西北地区修改) ---
+# 西安大致坐标 (34.34 N, 108.94 E)
+# 如果你知道具体电厂的经纬度，请在此处精确修改，这会显著提升 P_phy 的拟合度
+DEFAULT_LAT = 34.0  
+DEFAULT_LON = 109.0
+
+# ⚠️ 关键设置：数据采集器的时间标准
+# 即使电厂在西北，只要数据记录使用的是"北京时间"，这里必须是 'Asia/Shanghai'
+DATA_TIMEZONE = 'Asia/Shanghai' 
 
 def calc_physics_baseline(df, lat=DEFAULT_LAT, lon=DEFAULT_LON):
     try:
+        # 1. 时间处理
         times = pd.to_datetime(df['date'])
         if times.dt.tz is None:
-            times = pd.DatetimeIndex(times).tz_localize('UTC')
+            # 告诉 pvlib：CSV里的时间是北京时间
+            times = times.dt.tz_localize(DATA_TIMEZONE)
         else:
-            times = pd.DatetimeIndex(times)
+            times = times.dt.tz_convert(DATA_TIMEZONE)
 
-        location = pvlib.location.Location(lat, lon)
+        # 2. 物理建模 (使用西安经纬度 + 北京时间)
+        location = pvlib.location.Location(lat, lon, tz=DATA_TIMEZONE)
         cs = location.get_clearsky(times)
         
-        ghi = cs['ghi'].values
+        ghi_calc = cs['ghi'].values
         real_power = df['OT'].values
         
-        valid_mask = ghi > 10 
+        # 3. 拟合系数计算
+        valid_mask = ghi_calc > 10 
         if np.sum(valid_mask) > 0:
-            ratio = np.percentile(real_power[valid_mask], 95) / np.percentile(ghi[valid_mask], 95)
+            # 计算这一天的光电转换效率近似值
+            ratio = np.percentile(real_power[valid_mask], 95) / np.percentile(ghi_calc[valid_mask], 95)
+            ratio = min(ratio, 2.0) 
         else:
-            ratio = 1.0
+            ratio = 0.0
             
-        p_phy = ghi * ratio
-        p_phy = np.nan_to_num(p_phy, nan=0.0) 
+        p_phy = ghi_calc * ratio
+        p_phy = np.nan_to_num(p_phy, nan=0.0)
+        
         if len(p_phy) != len(df): p_phy = p_phy[:len(df)]
         return p_phy
 
@@ -51,7 +64,7 @@ def calc_physics_baseline(df, lat=DEFAULT_LAT, lon=DEFAULT_LON):
         traceback.print_exc()
         print(f"⚠️ Physics calc failed: {e}. Using zeros.")
         return np.zeros(len(df))
-    
+
 def run_vmd(signal):
     if np.all(signal == signal[0]):
         return np.zeros((len(signal), K_MODES))
@@ -68,47 +81,38 @@ def process_single_file(file_path):
     
     print(f"\n📄 Processing: {filename} ...")
     
-    # 1. 读取数据 (已经是标准化的 clean 数据)
     try:
         df = pd.read_csv(file_path)
     except Exception as e:
         print(f"❌ Read failed: {e}")
         return 0
     
-    # 2. 物理计算
     if 'OT' not in df.columns:
         print(f"❌ Skipping {filename}: No 'OT' column found.")
         return 0
         
+    # --- Step 1: 物理计算 (Xi'an Coords + BJ Time) ---
     p_raw = df['OT'].values
     p_phy = calc_physics_baseline(df)
     p_res = p_raw - p_phy
     
-    # 3. 准备 MVMD 输入 (动态选择存在的列)
+    # --- Step 2: 准备 MVMD 输入 ---
     targets = {}
-    
-    # (a) 核心变量
     targets['PowerRes'] = p_res
     
-    # (b) 辅助变量 (如果存在才添加)
-    if 'GHI' in df.columns:
-        targets['GHI'] = df['GHI'].values
-    if 'Temp' in df.columns:
-        targets['Temp'] = df['Temp'].values
-    if 'Humid' in df.columns:
-        targets['Humid'] = df['Humid'].values
-    if 'Pressure' in df.columns:
-        targets['Pressure'] = df['Pressure'].values
-    # 如果有 DNI/TSI 也可以加，根据你的需求
-    
-    # --- 检查 NaN/Inf ---
+    # 自动包含所有可能的变量
+    potential_cols = ['GHI', 'DNI', 'TSI', 'Temp', 'Humid', 'Pressure']
+    for col in potential_cols:
+        if col in df.columns:
+            targets[col] = df[col].values
+
     for k, v in targets.items():
         if not np.isfinite(v).all():
-            print(f"⚠️ Warning: {k} contains NaN/Inf. Filling with 0.")
             targets[k] = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # 4. 执行多进程 VMD
-    pool = multiprocessing.Pool(processes=len(targets))
+    # --- Step 3: VMD ---
+    pool_size = min(multiprocessing.cpu_count(), len(targets))
+    pool = multiprocessing.Pool(processes=pool_size)
     results = []
     keys = []
     
@@ -119,59 +123,36 @@ def process_single_file(file_path):
     pool.close()
     pool.join()
     
-    # 5. 组装结果
+    # --- Step 4: 输出 ---
     df_out = pd.DataFrame()
     df_out['date'] = df['date']
-    df_out['OT'] = p_raw      # 真值
-    df_out['P_PHY'] = p_phy   # 物理基线
+    df_out['OT'] = p_raw
+    df_out['P_PHY'] = p_phy 
     
-    # 放入分解后的分量
     for key, res in zip(keys, results):
-        modes = res.get() # [L, K]
+        modes = res.get()
         for k in range(K_MODES):
             col_name = f'{key}_IMF{k+1}'
             df_out[col_name] = modes[:, k]
             
-    # 6. 保存
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
     
     df_out.to_csv(save_path, index=False)
-    print(f"✅ Saved to: {save_path}")
-    print(f"   Decomposed {len(targets)} variables -> {len(df_out.columns)-3} features.")
     
-    # 返回特征数量 (减去 date, OT, P_PHY 这3个非输入列)
     feature_count = len(df_out.columns) - 3 
+    print(f"✅ Saved to: {save_path} (Features: {feature_count})")
     return feature_count
 
 if __name__ == '__main__':
     csv_files = glob.glob(os.path.join(INPUT_DIR, "*.csv"))
-    
     if not csv_files:
-        print(f"❌ No CSV files found in {INPUT_DIR}")
+        print(f"❌ No CSV files found.")
         exit()
         
-    print(f"🔍 Found {len(csv_files)} files. Starting pipeline...")
+    print(f"🔍 Processing {len(csv_files)} files with Location: Xi'an (Lat {DEFAULT_LAT}, Lon {DEFAULT_LON})...")
     
-    # 我们假设所有文件的特征维度是一样的，或者取第一个文件的维度作为参考
-    # 如果每个文件因为缺失列导致特征维度不同，训练时会有麻烦（Enc_in 不匹配）
-    # 但按照目前的清洗脚本，大部分主要列应该都在。
-    
-    enc_in_list = []
     for f in csv_files:
-        feat_dim = process_single_file(f)
-        enc_in_list.append(feat_dim)
+        process_single_file(f)
         
-    # 检查维度一致性
-    if len(set(enc_in_list)) > 1:
-        print("\n⚠️ WARNING: Feature dimensions inconsistent across files!")
-        print(f"Dimensions found: {enc_in_list}")
-        print("Model training might fail if batch_train mixes these files.")
-    
-    final_dim = enc_in_list[0] if enc_in_list else 0
-    
-    print("\n" + "="*50)
-    print("🚀 All Done!")
-    print(f"⚠️  Please use this for your run.py settings:")
-    print(f"   --enc_in {final_dim} --c_out {final_dim}")
-    print("="*50)
+    print("\n🚀 All Done.")
