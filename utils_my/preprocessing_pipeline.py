@@ -29,16 +29,22 @@ DATA_TIMEZONE = 'Asia/Shanghai'
 
 def calc_physics_baseline(df, lat=DEFAULT_LAT, lon=DEFAULT_LON):
     try:
-        # 1. 时间处理
-        times = pd.to_datetime(df['date'])
-        if times.dt.tz is None:
-            # 告诉 pvlib：CSV里的时间是北京时间
-            times = times.dt.tz_localize(DATA_TIMEZONE)
+        # --- 🔧 修复开始: 强制使用 DatetimeIndex ---
+        # 1. 显式构建 DatetimeIndex (避免生成 Series)
+        times = pd.DatetimeIndex(df['date'])
+        
+        # 2. 处理时区 (注意: Index 没有 .dt 访问器，直接调用 .tz_localize)
+        if times.tz is None:
+            # 这里的 DATA_TIMEZONE 应该是 'Asia/Shanghai'
+            times = times.tz_localize(DATA_TIMEZONE)
         else:
-            times = times.dt.tz_convert(DATA_TIMEZONE)
+            times = times.tz_convert(DATA_TIMEZONE)
+        # --- 🔧 修复结束 ---
 
         # 2. 物理建模 (使用西安经纬度 + 北京时间)
         location = pvlib.location.Location(lat, lon, tz=DATA_TIMEZONE)
+        
+        # ⚠️ 如果此时还报 TypeError，说明必须执行 pip install --upgrade pvlib
         cs = location.get_clearsky(times)
         
         ghi_calc = cs['ghi'].values
@@ -47,7 +53,6 @@ def calc_physics_baseline(df, lat=DEFAULT_LAT, lon=DEFAULT_LON):
         # 3. 拟合系数计算
         valid_mask = ghi_calc > 10 
         if np.sum(valid_mask) > 0:
-            # 计算这一天的光电转换效率近似值
             ratio = np.percentile(real_power[valid_mask], 95) / np.percentile(ghi_calc[valid_mask], 95)
             ratio = min(ratio, 2.0) 
         else:
@@ -60,11 +65,12 @@ def calc_physics_baseline(df, lat=DEFAULT_LAT, lon=DEFAULT_LON):
         return p_phy
 
     except Exception as e:
+        # 打印更详细的错误堆栈，方便调试
         import traceback
         traceback.print_exc()
         print(f"⚠️ Physics calc failed: {e}. Using zeros.")
         return np.zeros(len(df))
-
+    
 def run_vmd(signal):
     if np.all(signal == signal[0]):
         return np.zeros((len(signal), K_MODES))
