@@ -2,95 +2,143 @@ import os
 import pandas as pd
 import subprocess
 
-# ================= 核心路径配置 (使用绝对路径) =================
-# 1. 项目根目录 (run.py 所在的目录)
-project_root = "/root/autodl-tmp/Time-Series-Library/"
+# ================= 🔧 核心配置区域 =================
+PROJECT_ROOT = "/root/autodl-tmp/Time-Series-Library/"
+DATA_ROOT = os.path.join(PROJECT_ROOT, "dataset/solar_raw_clean/")
 
-# 2. 数据集目录 (你的CSV所在的目录)
-data_root_abs = os.path.join(project_root, "dataset/solar_processed/")
+# 1. 定义基线模型
+MODELS = [
+    'iTransformer', 
+    'PatchTST', 
+    'Mamba',          
+    'Transformer', 
+    'Informer', 
+    'Autoformer'
+]
 
-# ================= 训练配置 =================
-models_to_run = ['Mamba', 'iTransformer']
-seq_len = 96
-pred_len = 96
+PRED_LENS = [24, 96] 
+SEQ_LEN = 96
 
-# ================= 辅助函数：健壮读取 =================
-def read_csv_safe(path):
-    encodings = ['utf-8', 'gbk', 'cp1252', 'latin1']
-    for enc in encodings:
-        try:
-            return pd.read_csv(path, nrows=1, encoding=enc)
-        except UnicodeDecodeError:
-            continue
-    raise Exception(f"无法读取文件 {path}")
-
-# ================= 主逻辑 =================
-# 1. 强制切换工作目录到项目根目录 (确保能找到 run.py)
-os.chdir(project_root)
-print(f"已切换工作目录至: {os.getcwd()}")
-
-if not os.path.exists(data_root_abs):
-    print(f"❌ 错误：找不到数据目录 {data_root_abs}")
-    exit(1)
-
-files = [f for f in os.listdir(data_root_abs) if f.endswith('.csv')]
-files.sort()
-
-print(f"    准备开始训练，共检测到 {len(files)} 个数据文件...\n")
-
-for file_name in files:
-    file_path = os.path.join(data_root_abs, file_name)
-    
+# ================= 🛠️ 辅助函数 =================
+def get_csv_dim(path):
     try:
-        # 读取特征维度
-        df = read_csv_safe(file_path)
-        feat_dim = len(df.columns) - 1
-        
-        print(f"    当前文件: {file_name}")
-        print(f"    特征维度: {feat_dim} (enc_in={feat_dim})")
-        
-        for model_name in models_to_run:
-            # 生成短ID
-            short_name = file_name.split('(')[0].strip().replace(' ', '_').lower()[:15]
-            model_id = f"{model_name}_{short_name}"
-            
-            print(f"   正在启动: {model_name} (ID: {model_id})...")
-            
-            # 构建命令 (注意 data_path 只传文件名，root_path 传目录)
-            cmd = (
-                f"python run.py "
-                f"--task_name long_term_forecast "
-                f"--is_training 1 "
-                f"--root_path \"{data_root_abs}\" "
-                f"--data_path \"{file_name}\" "
-                f"--model_id {model_id} "
-                f"--model {model_name} "
-                f"--data custom "
-                f"--features M "
-                f"--seq_len {seq_len} "
-                f"--label_len 48 "
-                f"--pred_len {pred_len} "
-                f"--e_layers 2 "
-                f"--d_layers 1 "
-                f"--factor 3 "
-                f"--enc_in {feat_dim} "
-                f"--dec_in {feat_dim} "
-                f"--c_out {feat_dim} "
-                f"--des 'Exp' "
-                f"--itr 1 "
-                f"--batch_size 16 "
-                f"--train_epochs 5 "
-                f"--patience 3 "
-            )
-            
-            try:
-                # 这里的 shell=True 会在当前工作目录(即项目根目录)下执行
-                subprocess.check_call(cmd, shell=True)
-                print(f"   ✅ {model_name} 训练完成！\n")
-            except subprocess.CalledProcessError as e:
-                print(f"   ❌ {model_name} 训练失败 (Code: {e.returncode})\n")
-                
+        df = pd.read_csv(path, nrows=1)
+        return len(df.columns) - 1
     except Exception as e:
-        print(f"❌ 处理文件 {file_name} 出错: {e}\n")
+        print(f"❌ 无法读取文件 {path}: {e}")
+        return None
 
-print("🎉 全部任务结束！")
+def get_model_params(model_name):
+    """
+    针对 RTX 4090 的激进配置
+    """
+    # 基础配置 (Informer, Autoformer, Transformer)
+    base_params = {
+        "d_model": 512,
+        "d_ff": 2048,
+        "batch_size": 128,  # 激进提升: 32 -> 128
+        "learning_rate": 0.0001
+    }
+    
+    if model_name == 'Mamba':
+        # Mamba 极度省显存，但需要控制 d_state
+        return {
+            "d_model": 512,    # 提升维度
+            "d_ff": 32,        # d_state 保持 32
+            "batch_size": 256, # 直接拉满
+            "learning_rate": 0.001
+        }
+    elif model_name == 'iTransformer':
+        # iTransformer 显存占用极低，计算极快
+        return {
+            "d_model": 512,
+            "d_ff": 2048,
+            "batch_size": 256, # 直接拉满
+            "learning_rate": 0.0001
+        }
+    elif model_name == 'PatchTST':
+        # PatchTST 显存占用稍高 (O(L^2) Attention)，保守一点
+        return {
+            "d_model": 512,
+            "d_ff": 2048,
+            "batch_size": 64,  # PatchTST 64 应该能吃满 4090
+            "learning_rate": 0.0001
+        }
+    else:
+        return base_params
+
+# ================= 🚀 主逻辑 =================
+def main():
+    if os.getcwd() != PROJECT_ROOT:
+        os.chdir(PROJECT_ROOT)
+
+    if not os.path.exists(DATA_ROOT):
+        print(f"❌ 错误: 数据目录不存在 {DATA_ROOT}")
+        return
+
+    csv_files = [f for f in os.listdir(DATA_ROOT) if f.endswith('.csv')]
+    csv_files.sort()
+    
+    total_tasks = len(csv_files) * len(MODELS) * len(PRED_LENS)
+    print(f"🔍 发现 {len(csv_files)} 个站点，{len(MODELS)} 个模型。")
+    print(f"🔥 [RTX 4090 Mode] 预计执行 {total_tasks} 次训练...\n")
+
+    task_count = 0
+
+    for csv_file in csv_files:
+        file_path = os.path.join(DATA_ROOT, csv_file)
+        feat_dim = get_csv_dim(file_path)
+        if feat_dim is None: continue
+
+        site_id_clean = csv_file.replace('.csv', '').replace('(', '').replace(')', '').replace(' ', '_')
+        
+        for model_name in MODELS:
+            params = get_model_params(model_name)
+            
+            for pred_len in PRED_LENS:
+                task_count += 1
+                task_tag = "Short" if pred_len <= 48 else "Long"
+                model_id_arg = f"{site_id_clean}_{task_tag}{pred_len}"
+                
+                print(f"[{task_count}/{total_tasks}] 🚀 {model_name} | {site_id_clean} | Len={pred_len} | BS={params['batch_size']}")
+
+                cmd = (
+                    f"python run.py "
+                    f"--task_name long_term_forecast "
+                    f"--is_training 1 "
+                    f"--root_path \"{DATA_ROOT}\" "
+                    f"--data_path \"{csv_file}\" "
+                    f"--model_id {model_id_arg} "
+                    f"--model {model_name} "
+                    f"--data custom "
+                    f"--features M "
+                    f"--seq_len {SEQ_LEN} "
+                    f"--label_len 48 "
+                    f"--pred_len {pred_len} "
+                    f"--e_layers 2 "
+                    f"--d_layers 1 "
+                    f"--factor 3 "
+                    f"--enc_in {feat_dim} "
+                    f"--dec_in {feat_dim} "
+                    f"--c_out {feat_dim} "
+                    f"--des 'Exp' "
+                    f"--d_model {params['d_model']} "
+                    f"--d_ff {params['d_ff']} "
+                    f"--batch_size {params['batch_size']} "
+                    f"--learning_rate {params['learning_rate']} "
+                    f"--train_epochs 20 "     
+                    f"--patience 5 "          
+                    f"--num_workers 6 "       
+                    f"--itr 1 "
+                )
+
+                try:
+                    subprocess.run(cmd, shell=True, check=True)
+                    print(f"   ✅ Done.\n")
+                except subprocess.CalledProcessError:
+                    print(f"   ❌ Failed. Skipping...\n")
+    
+    print("\n🎉 所有实验结束！")
+
+if __name__ == "__main__":
+    main()
