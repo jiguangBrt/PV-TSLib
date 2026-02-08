@@ -12,6 +12,9 @@ import numpy as np
 from utils.dtw_metric import dtw, accelerated_dtw
 from utils.augmentation import run_augmentation, run_augmentation_single
 
+import time
+from thop import profile, clever_format
+
 warnings.filterwarnings('ignore')
 
 
@@ -177,6 +180,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
+        # ⚡️ 新增：记录推理时间和 FLOPs
+        inference_times = []
+        flops_computed = False
+        total_flops = 0
+        total_params = 0
+        
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
@@ -189,13 +198,33 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                
+                # ⚡️ 计时开始
+                start_time = time.time()
+                
                 # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
+                # ⚡️ 计时结束
+            inference_times.append(time.time() - start_time)
+            
+            # ⚡️ 计算 FLOPs (只在第一个 batch 计算一次)
+            if not flops_computed:
+                try:
+                    flops, params = profile(self.model, inputs=(batch_x, batch_x_mark, dec_inp, batch_y_mark), verbose=False)
+                    total_flops, total_params = clever_format([flops, params], "%.3f")
+                    flops_computed = True
+                    print(f"📊 FLOPs: {total_flops}, Params: {total_params}")
+                except Exception as e:
+                    print(f"⚠️ FLOPs calculation failed: {e}")
+                    total_flops = "N/A"
+                    total_params = "N/A"
+                    flops_computed = True
+                    
+                    
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, :]
                 batch_y = batch_y[:, -self.args.pred_len:, :].to(self.device)
@@ -231,7 +260,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
         trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
         print('test shape:', preds.shape, trues.shape)
-
+        # ⚡️ 计算性能指标
+        avg_inference_time = np.mean(inference_times)
+        total_inference_time = np.sum(inference_times)
+    
+        print(f"⏱️ Inference Time: Avg={avg_inference_time:.4f}s/batch, Total={total_inference_time:.2f}s")
+        print(f"📊 FLOPs: {total_flops}, Params: {total_params}")
+        
         # result save
         folder_path = './results/' + setting + '/'
         if not os.path.exists(folder_path):
@@ -254,6 +289,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         print('mse:{}, mae:{}, dtw:{}'.format(mse, mae, dtw))
+        performance_metrics = {
+        'mse': mse,
+        'mae': mae,
+        'rmse': rmse,
+        'mape': mape,
+        'mspe': mspe,
+        'avg_inference_time': avg_inference_time,
+        'total_inference_time': total_inference_time,
+        'flops': str(total_flops),
+        'params': str(total_params)
+        }
         f = open("result_long_term_forecast.txt", 'a')
         f.write(setting + "  \n")
         f.write('mse:{}, mae:{}, dtw:{}'.format(mse, mae, dtw))
@@ -262,6 +308,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         f.close()
 
         np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
+        np.save(folder_path + 'performance.npy', performance_metrics)  # ⚡️ 新增
         np.save(folder_path + 'pred.npy', preds)
         np.save(folder_path + 'true.npy', trues)
 

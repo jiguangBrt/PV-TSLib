@@ -1,144 +1,157 @@
 import torch
 import torch.nn as nn
-import torch.fft
-from layers.Embed import DataEmbedding_inverted
+import torch.nn.functional as F
 from mamba_ssm import Mamba
 
-class RLMambaBlock(nn.Module):
-    """
-    Residual Learning Mamba Block (Based on provided diagram)
-    Structure:
-    1. x -> Mamba -> y1
-    2. Subtraction: res1 = x - y1
-    3. Norm -> FF -> y2
-    4. Subtraction: res2 = Norm(res1) - y2
-    5. Gate/Activation -> Norm -> Output
-    """
-    def __init__(self, d_model, d_state, d_conv, expand):
-        super(RLMambaBlock, self).__init__()
-        self.d_model = d_model
+class VariateEmbedding(nn.Module):
+    """类似 iTransformer 的变量级嵌入 (Variate-wise Embedding)"""
+    def __init__(self, num_variates, d_model):
+        super().__init__()
+        self.embedding = nn.Linear(1, d_model)  # 每个变量独立嵌入
+        self.num_variates = num_variates
         
-        # Branch 1: Mamba
-        self.mamba = Mamba(
-            d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand
-        )
-        
-        # Branch 2: Feed Forward
-        self.norm1 = nn.LayerNorm(d_model)
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_model * 2, d_model)
-        )
-        
-        # Output Stage
-        self.act = nn.SiLU() # Sigmoid/SiLU based on diagram sigma
-        self.norm2 = nn.LayerNorm(d_model)
-
     def forward(self, x):
-        # x: [B, L, D] or [B, V, D] depending on domain
-        
-        # --- Path 1: Mamba Learning ---
-        mamba_out = self.mamba(x)
-        
-        # --- Subtraction 1: What Mamba missed ---
-        res1 = x - mamba_out
-        
-        # --- Path 2: FF Learning ---
-        res1_norm = self.norm1(res1)
-        ff_out = self.ff(res1_norm)
-        
-        # --- Subtraction 2: What FF missed ---
-        # Diagram logic: Input to FF minus Output of FF
-        res2 = res1_norm - ff_out
-        
-        # --- Output Gate/Activation ---
-        out = self.norm2(self.act(res2))
-        
-        # Note: Diagram shows a bottom connection (Input -> C -> Sigma).
-        # Typically in RLMamba, this might be a highway connection. 
-        # Here we return the refined residual representation.
-        return out + x # Add original x for deep network stability (ResNet style)
+        # x: [B, L, C] -> [B, L, C, d_model]
+        B, L, C = x.shape
+        x = x.unsqueeze(-1)  # [B, L, C, 1]
+        x = self.embedding(x)  # [B, L, C, d_model]
+        return x.reshape(B, L, C * self.num_variates)  # 暂时不展开,后续调整
 
-class SpectralMambaBlock(nn.Module):
-    """
-    Freq-Domain Mamba with RLMamba Structure
-    """
-    def __init__(self, d_model, d_state, d_conv, expand):
-        super(SpectralMambaBlock, self).__init__()
-        # Use RLMamba structure but for Frequency Features
-        # Since complex inputs are concatenated (real+imag), dim is doubled
-        self.rl_mamba = RLMambaBlock(d_model * 2, d_state, d_conv, expand)
-        self.out_proj = nn.Linear(d_model * 2, d_model)
-
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation Channel Attention"""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.fc1 = nn.Linear(channels, channels // reduction, bias=False)
+        self.fc2 = nn.Linear(channels // reduction, channels, bias=False)
+        
     def forward(self, x):
-        # 1. FFT
-        x_freq = torch.fft.rfft(x, dim=-1, norm='ortho')
-        x_freq_concat = torch.cat([x_freq.real, x_freq.imag], dim=-1)
+        # x: [B, L, C]
+        B, L, C = x.shape
+        # Squeeze: Global Average Pooling
+        squeeze = x.mean(dim=1)  # [B, C]
+        # Excitation: FC-ReLU-FC-Sigmoid
+        excitation = self.fc2(F.relu(self.fc1(squeeze)))  # [B, C]
+        excitation = torch.sigmoid(excitation).unsqueeze(1)  # [B, 1, C]
+        # Scale
+        return x * excitation
+
+class DualDomainMamba(nn.Module):
+    """双域 Mamba: 时域 + 频域并行"""
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.time_mamba = Mamba(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self.freq_mamba = Mamba(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        # 融合层: 时域 + 频域 -> d_model
+        self.fusion = nn.Linear(d_model * 2, d_model)
         
-        # 2. RLMamba in Freq Domain
-        x_freq_out = self.rl_mamba(x_freq_concat)
+    def forward(self, x):
+        # x: [B, L, d_model]
+        B, L, C = x.shape
         
-        # 3. Inverse
-        n_freq = x_freq.shape[-1]
-        x_out_real = x_freq_out[:, :, :n_freq]
-        x_out_imag = x_freq_out[:, :, n_freq:]
-        x_freq_complex = torch.complex(x_out_real, x_out_imag)
-        x_out = torch.fft.irfft(x_freq_complex, n=x.shape[-1], dim=-1, norm='ortho')
-        return x_out
+        # 时域分支
+        time_out = self.time_mamba(x)  # [B, L, d_model]
+        
+        # 频域分支: FFT -> Mamba -> iFFT
+        x_freq = torch.fft.rfft(x, dim=1, norm='ortho')  # [B, L//2+1, d_model] (复数)
+        x_freq_real = torch.cat([x_freq.real, x_freq.imag], dim=-1)  # [B, L//2+1, 2*d_model]
+        
+        # 调整维度以适配 Mamba (需要补齐到 L 长度)
+        # 方法: 用零填充或插值
+        freq_len = x_freq.shape[1]
+        if freq_len < L:
+            pad_len = L - freq_len
+            x_freq_padded = F.pad(x_freq_real, (0, 0, 0, pad_len))  # [B, L, 2*d_model]
+        else:
+            x_freq_padded = x_freq_real[:, :L, :]
+            
+        # 投影到 d_model 维度
+        x_freq_input = x_freq_padded[..., :C]  # 简化: 只取实部 [B, L, d_model]
+        freq_out = self.freq_mamba(x_freq_input)  # [B, L, d_model]
+        
+        # 拼接 + 融合
+        dual_out = torch.cat([time_out, freq_out], dim=-1)  # [B, L, 2*d_model]
+        fused = self.fusion(dual_out)  # [B, L, d_model]
+        
+        return fused
 
 class Model(nn.Module):
+    """
+    PhysicsMamba: 物理去趋势 + MVMD + 双域 Mamba + SE Attention
+    
+    关键假设:
+    - 输入数据已经过 MVMD 分解 (所有 IMF 已拼接在 enc_in 中)
+    - 模型预测 PowerRes (去趋势功率), 外部加回 P_PHY 得到 OT
+    """
     def __init__(self, configs):
-        super(Model, self).__init__()
+        super().__init__()
+        self.configs = configs
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
+        self.d_model = configs.d_model
+        self.enc_in = configs.enc_in  # 输入 IMF 总维度 (48 或 56)
+        self.c_out = configs.c_out    # 输出维度 (预测 PowerRes IMFs)
         
-        # Inverted Embedding
-        self.enc_embedding = DataEmbedding_inverted(configs.seq_len, configs.d_model, configs.embed, configs.freq, configs.dropout)
-
-        # Dual-Domain Encoder Layers
-        self.layers = nn.ModuleList()
-        for i in range(configs.e_layers):
-            self.layers.append(nn.ModuleDict({
-                'time_rlmamba': RLMambaBlock(
-                    configs.d_model, configs.d_ff, configs.d_conv, configs.expand
-                ),
-                'freq_rlmamba': SpectralMambaBlock(
-                    configs.d_model, configs.d_ff, configs.d_conv, configs.expand
-                ),
-                'norm': nn.LayerNorm(configs.d_model)
-            }))
-
-        self.projector = nn.Linear(configs.d_model, configs.pred_len, bias=True)
+        # ⚠️ 修改这里: 使用 getattr 设置默认值,不依赖命令行参数
+        d_state = getattr(configs, 'd_state', 16)      # 默认 16
+        d_conv = getattr(configs, 'd_conv', 4)         # 默认 4
+        expand = getattr(configs, 'expand', 2)         # 默认 2
         
-    def forecast(self, x_enc, x_mark_enc):
-        # Normalize
-        means = x_enc.mean(1, keepdim=True).detach()
-        x_enc = x_enc - means
-        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
-        x_enc /= stdev
-
-        # Embedding: [B, L, V] -> [B, V, D]
-        x = self.enc_embedding(x_enc, x_mark_enc) 
-
-        # Dual-Domain Processing
-        for layer in self.layers:
-            # Parallel Dual-Domain Branches
-            out_time = layer['time_rlmamba'](x)
-            out_freq = layer['freq_rlmamba'](x)
-            
-            # Fusion
-            x = layer['norm'](out_time + out_freq)
-
-        # Projection: [B, V, D] -> [B, V, Pred_Len]
-        dec_out = self.projector(x)
-        dec_out = dec_out.permute(0, 2, 1) # -> [B, Pred_Len, V]
-
-        # De-Normalize
-        dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
-        dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
-        return dec_out
-
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
-        return self.forecast(x_enc, x_mark_enc)
+        # 1. 输入投影: 所有 IMF -> d_model
+        self.input_projection = nn.Linear(self.enc_in, self.d_model)
+        
+        # 2. 双域 Mamba 块 (可堆叠多层)
+        self.num_layers = getattr(configs, 'e_layers', 2)
+        self.dual_mamba_layers = nn.ModuleList([
+            DualDomainMamba(
+                d_model=self.d_model,
+                d_state=d_state,    # 使用局部变量
+                d_conv=d_conv,      # 使用局部变量
+                expand=expand,      # 使用局部变量
+            ) for _ in range(self.num_layers)
+        ])
+        
+        # 3. SE Channel Attention
+        self.se_block = SEBlock(self.d_model, reduction=16)
+        
+        # 4. 输出投影: d_model -> c_out (预测 PowerRes IMFs)
+        self.output_projection = nn.Linear(self.d_model, self.c_out)
+        
+        # 5. 预测头: seq_len -> pred_len
+        self.predict_head = nn.Linear(self.seq_len, self.pred_len)
+        
+    def forward(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, mask=None):
+        # x_enc: [B, seq_len, enc_in] - 所有 IMF 拼接后的输入
+        B, L, _ = x_enc.shape
+        
+        # Step 1: 输入投影
+        x = self.input_projection(x_enc)  # [B, seq_len, d_model]
+        
+        # Step 2: 多层双域 Mamba
+        for mamba_layer in self.dual_mamba_layers:
+            residual = x
+            x = mamba_layer(x)  # [B, seq_len, d_model]
+            x = x + residual  # 残差连接
+            x = F.layer_norm(x, (self.d_model,))  # LayerNorm
+        
+        # Step 3: SE Channel Attention
+        x = self.se_block(x)  # [B, seq_len, d_model]
+        
+        # Step 4: 时间维度投影 seq_len -> pred_len
+        x = x.transpose(1, 2)  # [B, d_model, seq_len]
+        x = self.predict_head(x)  # [B, d_model, pred_len]
+        x = x.transpose(1, 2)  # [B, pred_len, d_model]
+        
+        # Step 5: 输出投影 d_model -> c_out (PowerRes IMFs)
+        output = self.output_projection(x)  # [B, pred_len, c_out]
+        
+        return output  # [B, pred_len, c_out]
